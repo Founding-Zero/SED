@@ -14,14 +14,20 @@
 """PettingZoo interface to meltingpot environments."""
 
 import functools
-
+import random
+import numpy as np
 import matplotlib.pyplot as plt
 from gymnasium import utils as gym_utils
 from meltingpot import substrate
 from meltingpot.examples.gym import utils
+import torch
 from ml_collections import config_dict
 from pettingzoo import utils as pettingzoo_utils
 from pettingzoo.utils import wrappers
+import supersuit as ss
+import gymnasium as gym
+
+from sen.vector_constructors import pettingzoo_env_to_vec_env_v1, sb3_concat_vec_envs_v1
 
 PLAYER_STR_FORMAT = "player_{index}"
 MAX_CYCLES = 5000
@@ -30,10 +36,8 @@ MAX_CYCLES = 5000
 def parallel_env(env_config, max_cycles=MAX_CYCLES, principal=None):
     return _ParallelEnv(env_config, max_cycles, principal)
 
-
 def raw_env(env_config, max_cycles=MAX_CYCLES):
     return pettingzoo_utils.parallel_to_aec_wrapper(parallel_env(env_config, max_cycles))
-
 
 def env(env_config, max_cycles=MAX_CYCLES):
     aec_env = raw_env(env_config, max_cycles)
@@ -140,3 +144,27 @@ class _ParallelEnv(_MeltingPotPettingZooEnv, gym_utils.EzPickle):
     def __init__(self, env_config, max_cycles, principal=None):
         gym_utils.EzPickle.__init__(self, env_config, max_cycles)
         _MeltingPotPettingZooEnv.__init__(self, env_config, max_cycles, principal)
+
+def seed_everything(seed, deterministic):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = deterministic
+
+def set_up_envs(env, frames, parallel_games):
+    env = ss.observation_lambda_v0(env, lambda x, _: x["RGB"], lambda s: s["RGB"])
+    env = ss.frame_stack_v1(env, frames)
+    env = ss.agent_indicator_v0(env, type_only=False)
+    env = pettingzoo_env_to_vec_env_v1(env)
+    envs = sb3_concat_vec_envs_v1(  # need our own as need reset to pass up world obs and nearby in info
+        env, num_vec_envs=parallel_games
+    )
+    envs.single_observation_space = envs.observation_space
+    envs.single_action_space = envs.action_space
+    envs.is_vector_env = True
+    assert isinstance(
+        envs.single_action_space, gym.spaces.Discrete
+    ), "only discrete action space is supported"
+
+    return envs
+

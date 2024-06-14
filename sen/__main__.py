@@ -1,4 +1,3 @@
-import dataclasses
 from dataclasses import dataclass
 
 import typer
@@ -8,25 +7,19 @@ from typer_config.decorators import dump_json_config, use_json_config
 from sen import setup_experiment
 
 setup_experiment()
-import argparse
 import copy
 import os
-import random
 import shutil
 import time
 import warnings
 from dataclasses import dataclass
-from distutils.util import strtobool
 
-import gymnasium as gym
 import numpy as np
-import supersuit as ss
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import typer
-from eztils import datestr
 from eztils.typer import dataclass_option
 from meltingpot import substrate
 from torch.utils.tensorboard import SummaryWriter
@@ -36,7 +29,7 @@ from sen import LOG_DIR, huggingface_upload, utils, version
 from sen.neural.agent_architectures import Agent, PrincipalAgent
 from sen.principal import Principal
 from sen.principal.utils import vote
-from sen.vector_constructors import pettingzoo_env_to_vec_env_v1, sb3_concat_vec_envs_v1
+from utils import *
 
 app = typer.Typer(
     name="sen",
@@ -68,7 +61,9 @@ class Config:
         0.02  # proportion of episodes over which to linearly anneal tax cap multiplier
     )
     sampling_horizon: int = 200  # the number of timesteps between policy update iterations
-    tax_period: int = 50  # the number of timesteps tax periods last (at end of period tax vals updated and taxes applied)
+    tax_period: int = (
+        50  # the number of timesteps tax periods last (at end of period tax vals updated and taxes applied)
+    )
     anneal_tax: bool = True  # Toggle tax cap annealing over an initial proportion of episodes
     anneal_lr: bool = True  # Toggle learning rate annealing for policy and value networks
     gamma: float = 0.99  # the discount factor gamma
@@ -77,7 +72,9 @@ class Config:
     update_epochs: int = 4  # the K epochs to update the policy
     norm_adv: bool = True  # Toggles advantages normalization
     clip_coef: float = 0.2  # the surrogate clipping coefficient
-    clip_vloss: bool = True  # Toggles whether or not to use a clipped loss for the value function, as per the paper.
+    clip_vloss: bool = (
+        True  # Toggles whether or not to use a clipped loss for the value function, as per the paper.
+    )
     ent_coef: float = 0.01  # coefficient of the entropy
     vf_coef: float = 0.5  # coefficient of the value function
     max_grad_norm: float = 0.5  # the maximum norm for the gradient clipping
@@ -91,6 +88,8 @@ def main(
     conf: dataclass_option(Config) = "{}",  # type: ignore
 ) -> None:
     args: Config = conf  # for type hinting
+
+    # set up logging
     run_name = f"apple_picking__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -111,49 +110,35 @@ def main(
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.torch_deterministic
-
+    seed_everything(args.seed, args.torch_deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print("device:", device)
 
+    # set up env
     env_name = "commons_harvest__open"
     env_config = substrate.get_config(env_name)
 
+    # init principal
     num_players = len(env_config.default_player_roles)
     principal = Principal(num_players, args.num_parallel_games, "egalitarian")
 
     env = utils.parallel_env(
         max_cycles=args.sampling_horizon, env_config=env_config, principal=principal
     )
+
     num_agents = env.max_num_agents
     num_envs = args.num_parallel_games * num_agents
-    env.render_mode = "rgb_array"
-
-    env = ss.observation_lambda_v0(env, lambda x, _: x["RGB"], lambda s: s["RGB"])
-    env = ss.frame_stack_v1(env, args.num_frames)
-    env = ss.agent_indicator_v0(env, type_only=False)
-    env = pettingzoo_env_to_vec_env_v1(env)
-    envs = sb3_concat_vec_envs_v1(  # need our own as need reset to pass up world obs and nearby in info
-        env, num_vec_envs=args.num_parallel_games
-    )
-
-    envs.single_observation_space = envs.observation_space
-    envs.single_action_space = envs.action_space
-    envs.is_vector_env = True
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Discrete
-    ), "only discrete action space is supported"
-
     voting_values = np.random.uniform(size=[num_agents])
     selfishness = np.random.uniform(size=[num_agents])
     trust = np.random.uniform(size=[num_agents])
 
+    env.render_mode = "rgb_array"
+    envs = set_up_envs(env, args.num_frames, args.num_parallel_games)
+
     agent = Agent(envs).to(device)
-    principal_agent = PrincipalAgent(num_agents).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=args.adam_eps)
+
+    principal_agent = PrincipalAgent(num_agents).to(device)
     principal_optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=args.adam_eps)
 
     # ALGO Logic: Storage setup
@@ -163,10 +148,7 @@ def main(
     actions = torch.zeros((args.sampling_horizon, num_envs) + envs.single_action_space.shape).to(
         device
     )
-    logprobs = torch.zeros((args.sampling_horizon, num_envs)).to(device)
-    rewards = torch.zeros((args.sampling_horizon, num_envs)).to(device)
-    dones = torch.zeros((args.sampling_horizon, num_envs)).to(device)
-    values = torch.zeros((args.sampling_horizon, num_envs)).to(device)
+    logprobs = rewards = dones = values = torch.zeros((args.sampling_horizon, num_envs)).to(device)
 
     principal_obs = torch.zeros(
         (args.sampling_horizon, args.num_parallel_games) + (144, 192, 3)
@@ -174,11 +156,11 @@ def main(
     cumulative_rewards = torch.zeros(
         (args.sampling_horizon, args.num_parallel_games, num_agents)
     ).to(device)
+
     principal_actions = torch.zeros((args.sampling_horizon, args.num_parallel_games, 3)).to(device)
-    principal_logprobs = torch.zeros((args.sampling_horizon, args.num_parallel_games)).to(device)
-    principal_rewards = torch.zeros((args.sampling_horizon, args.num_parallel_games)).to(device)
-    principal_dones = torch.zeros((args.sampling_horizon, args.num_parallel_games)).to(device)
-    principal_values = torch.zeros((args.sampling_horizon, args.num_parallel_games)).to(device)
+    principal_logprobs = principal_rewards = principal_dones = principal_values = torch.zeros(
+        (args.sampling_horizon, args.num_parallel_games)
+    ).to(device)
 
     next_obs = torch.Tensor(envs.reset()).to(device)
     next_done = torch.zeros(num_envs).to(device)
@@ -189,14 +171,8 @@ def main(
     ).to(device)
     principal_next_done = torch.zeros(args.num_parallel_games).to(device)
 
-    num_policy_updates_per_ep = args.episode_length // args.sampling_horizon
-    num_policy_updates_total = args.num_episodes * num_policy_updates_per_ep
-    num_updates_for_this_ep = 0
-    current_episode = 1
-    episode_step = 0
     episode_rewards = torch.zeros(num_envs).to(device)
     principal_episode_rewards = torch.zeros(args.num_parallel_games).to(device)
-    start_time = time.time()
 
     prev_objective_val = 0
     tax_values = []
@@ -210,6 +186,11 @@ def main(
     """
     # warnings.warn("loading pretrained agents")
     # agent.load_state_dict(torch.load("./model9399.pth"))
+    num_policy_updates_per_ep = args.episode_length // args.sampling_horizon
+    num_policy_updates_total = args.num_episodes * num_policy_updates_per_ep
+    num_updates_for_this_ep = 0
+    current_episode = 1
+    episode_step = 0
 
     for update in range(1, num_policy_updates_total + 1):
         # annealing the rate if instructed to do so
@@ -287,7 +268,6 @@ def main(
             intrinsic_reward = np.zeros_like(extrinsic_reward)
             nearby = torch.stack([torch.Tensor(info[i][2]) for i in range(0, num_envs)]).to(device)
             for game_id in range(args.num_parallel_games):
-                game_reward = extrinsic_reward[game_id * num_agents : (game_id + 1) * num_agents]
                 for player_id in range(num_agents):
                     env_id = player_id + game_id * num_agents
                     w = selfishness[player_id]
